@@ -1,53 +1,73 @@
+# app_rag_nova.py
+# One-file NiceGUI app with:
+# - Upload to S3 (presigned PUT) -> row in documents -> SQS message
+# - Local SQS poller (simulates Lambda) that: downloads file, extracts text, chunks, embeds (Titan v2 in us-east-1), inserts rows in public.doc_chunks
+# - RAG chat endpoints using Amazon Nova Pro (us-east-1) + pgvector retrieval
+#
+# Requirements (pip):
+#   nicegui boto3 botocore httpx fastapi pypdf psycopg
+#
+# IMPORTANT:
+# - Uses local AWS profile "martin" for credentials (no env vars).
+# - S3 in ap-southeast-5 (your original), Bedrock models in us-east-1 as requested.
+# - PostgreSQL connection details are hardcoded (from your snippet).
+#
+# Run:
+#   python app_rag_nova.py
+#
+# Then open http://localhost:8080
+
 import os
+import io
+import json
 import uuid
+import time
 import mimetypes
 from datetime import datetime
-
-from nicegui import ui, app
-import boto3
-from botocore.exceptions import ClientError
-import httpx
-from fastapi import Request
-from botocore.config import Config
-import psycopg
-from uuid import uuid4
-from typing import Optional, List
+from typing import List, Dict, Any, Optional
 from urllib.parse import quote
-import json
+import psycopg2
+import psycopg2.extras
+
+import httpx
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from pypdf import PdfReader
+
+import psycopg
+from nicegui import ui, app as nice_app
+from fastapi import Request, Body, HTTPException
 
 # =========================
-# Config
+# CONFIG (all hardcoded)
 # =========================
-S3_BUCKET = os.getenv('S3_BUCKET', 'hackathon-doc-search-bucket')
-AWS_REGION = os.getenv('AWS_REGION', 'ap-southeast-5')
+# Your existing values
+S3_BUCKET = 'hackathon-doc-search-bucket'
+AWS_REGION_S3 = 'ap-southeast-5'            # where your bucket lives
+AWS_PROFILE = 'martin'                      # local profile
+SQS_QUEUE_URL = 'https://sqs.ap-southeast-5.amazonaws.com/239974788694/doc-ingest-queue'
 
-# =========================
-# Database Config
-# =========================
+# Bedrock config (as requested)
+BEDROCK_REGION = 'us-east-1'
+BEDROCK_EMBED_MODEL_ID = 'amazon.titan-embed-text-v2:0'
+BEDROCK_CHAT_MODEL_ID  = 'amazon.nova-pro-v1:0'
+
+# PostgreSQL (from your snippet)
 PGHOST = "database-1.cdguu8qi48bg.ap-southeast-5.rds.amazonaws.com"
 PGPORT = 5432
 PGUSER = "postgres"
 PGPASSWORD = ">6bzBcyB~3*gPE_GpBOl771Bc[nN"
 PGDATABASE = "postgres"
 
-def get_conn():
-    return psycopg.connect(
-        host=PGHOST,
-        port=PGPORT,
-        user=PGUSER,
-        password=PGPASSWORD,
-        dbname=PGDATABASE,
-        sslmode="require",
-    )
-
-# With this:
-# session = boto3.Session(profile_name='martin')
-session = boto3.Session()
+# =========================
+# AWS clients (single Session)
+# =========================
+session = boto3.Session(profile_name=AWS_PROFILE)
 
 def get_bucket_region(bucket: str) -> str:
-    # S3 returns None for us-east-1
-    s3 = session.client('s3')
-    loc = s3.get_bucket_location(Bucket=bucket)['LocationConstraint']
+    s3_probe = session.client('s3')
+    loc = s3_probe.get_bucket_location(Bucket=bucket)['LocationConstraint']
     return loc or 'us-east-1'
 
 def s3_client_for_bucket(bucket: str):
@@ -58,21 +78,28 @@ def s3_client_for_bucket(bucket: str):
         config=Config(signature_version='s3v4', s3={'addressing_style': 'virtual'}),
     )
 
-# Use this client everywhere you presign or call S3 for that bucket:
 s3 = s3_client_for_bucket(S3_BUCKET)
-
-file_storage = {}
-
-
-SQS_QUEUE_URL = 'https://sqs.ap-southeast-5.amazonaws.com/239974788694/doc-ingest-queue'  # <— paste YOUR URL
-sqs = session.client('sqs', region_name='ap-southeast-5')
+sqs = session.client('sqs', region_name=AWS_REGION_S3)
+bedrock_rt = session.client('bedrock-runtime', region_name=BEDROCK_REGION)
 
 # =========================
-# Helpers
+# DB helpers
+# =========================
+def get_conn():
+    return psycopg.connect(
+        host=PGHOST,
+        port=PGPORT,
+        user=PGUSER,
+        password=PGPASSWORD,
+        dbname=PGDATABASE,
+        sslmode="require",
+    )
+
+# =========================
+# Utils
 # =========================
 def get_base_url():
-    # This gets your current host and port
-    return 'http://localhost:8080'  # Simple version
+    return 'http://localhost:8080'
 
 def human_size(n: int) -> str:
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -88,10 +115,206 @@ def new_file_key(original: str) -> str:
     today = datetime.utcnow().strftime('%Y/%m/%d')
     return f"uploads/{today}/{uuid.uuid4()}{safe_ext(original)}"
 
+def chunk_text(txt: str, chunk_chars=2000, overlap=200) -> List[str]:
+    n = len(txt)
+    if n == 0:
+        return []
+    out, i = [], 0
+    while i < n:
+        j = min(n, i + chunk_chars)
+        c = txt[i:j].strip()
+        if c:
+            out.append(c)
+        i = max(0, j - overlap)
+    return out
+
+def extract_text_from_pdf_bytes(b: bytes) -> str:
+    reader = PdfReader(io.BytesIO(b))
+    parts = []
+    for p in reader.pages:
+        t = p.extract_text() or ""
+        parts.append(t)
+    return "\n".join(parts)
+
+# =========================
+# Bedrock helpers (Titan embeddings + Nova Pro chat)
+# =========================
+def titan_embed(text: str):
+    # Titan takes a single string, not an array
+    body = {"inputText": text}
+    resp = bedrock_rt.invoke_model(
+        modelId="amazon.titan-embed-text-v1",   # <-- 1536 dims
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    payload = json.loads(resp["body"].read())
+    return payload["embedding"]  # single vector of floats
+
+PG_CONN_STR = f"host={PGHOST} port={PGPORT} dbname={PGDATABASE} user={PGUSER} password={PGPASSWORD}"
+
+def run_query(sql: str, params=None):
+    conn = psycopg2.connect(PG_CONN_STR)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if cur.description:  # SELECT
+                return cur.fetchall()
+            else:
+                conn.commit()
+                return []
+    finally:
+        conn.close()
+
+def semantic_search(query: str, top_k: int = 3):
+    """Embed query and search doc_chunks for nearest neighbors."""
+    # 1. Generate embedding with Titan
+    q_emb = titan_embed(query)  # -> list[float] (length 1024 if v2)
+
+    # 2. Convert to Postgres vector string
+    q_emb_str = "[" + ",".join(f"{x:.6f}" for x in q_emb) + "]"
+
+    # 3. Query Postgres
+    rows = run_query("""
+        SELECT d.id, d.title, d.s3_key, c.content,
+               1 - (c.embedding <=> %s::vector) AS score
+        FROM doc_chunks c
+        JOIN documents d ON d.id = c.document_id
+        ORDER BY c.embedding <=> %s::vector
+        LIMIT %s;
+    """, (q_emb_str, q_emb_str, top_k))
+
+    return rows
+
+def to_pgvector(v):
+    # pgvector expects a string literal: [0.1,0.2,...]
+    return "[" + ",".join(f"{x:.6f}" for x in v) + "]"
+
+def nova_pro_answer(system_text: Optional[str], user_text: str, max_tokens=800, temperature=0.2) -> str:
+    """
+    Nova Pro via Bedrock "messages" style payload.
+    """
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"text": user_text}]}
+        ],
+        "inferenceConfig": {
+            "maxTokens": max_tokens,
+            "temperature": temperature
+        }
+    }
+    if system_text:
+        body["system"] = [{"text": system_text}]
+
+    resp = bedrock_rt.invoke_model(
+        modelId=BEDROCK_CHAT_MODEL_ID,
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    data = json.loads(resp["body"].read())
+    # response shape: { "output": { "message": { "content": [ {"text": "..."} ] } }, ... }
+    try:
+        contents = data["output"]["message"]["content"]
+        parts = [c.get("text", "") for c in contents if "text" in c]
+        return "".join(parts).strip()
+    except Exception:
+        # Fallback to alternative shapes if any
+        return json.dumps(data)
+
+# =========================
+# Local "ingestor" (poll SQS and process) — simulates Lambda
+# =========================
+_INGESTOR_RUNNING = {"flag": False}
+
+def process_sqs_message(body: Dict[str, Any]) -> None:
+    """
+    Body schema from /api/upload/init:
+    {
+        "document_id": "...",
+        "bucket": "...",
+        "s3_key": "...",
+        "title": "...",
+        "mime_type": "..."
+    }
+    """
+    doc_id = body["document_id"]
+    key = body["s3_key"]
+    mime = body.get("mime_type") or ""
+
+    # 1) Download object
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    blob = obj["Body"].read()
+
+    # 2) Extract text
+    if mime.startswith("application/pdf") or key.lower().endswith(".pdf"):
+        text = extract_text_from_pdf_bytes(blob)
+    else:
+        try:
+            text = blob.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+
+    if not text.strip():
+        return
+
+    # 3) Chunk + embed
+    chunks = chunk_text(text)
+    embeddings: List[List[float]] = []
+    B = 16
+    for i in range(0, len(chunks), B):
+        embeddings.extend(titan_embed(chunks[i:i+B]))
+
+    # 4) Insert into public.doc_chunks
+    with get_conn() as conn, conn.cursor() as cur:
+        rows = [
+            (str(uuid.uuid4()), doc_id, idx, chunks[idx], embeddings[idx], None)
+            for idx in range(len(chunks))
+        ]
+        cur.executemany(
+            """
+            INSERT INTO public.doc_chunks
+                (id, document_id, chunk_index, content, embedding, token_count)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            """,
+            rows,
+        )
+
+def poll_sqs_once(max_messages=5, wait_seconds=2):
+    resp = sqs.receive_message(
+        QueueUrl=SQS_QUEUE_URL,
+        MaxNumberOfMessages=max_messages,
+        WaitTimeSeconds=wait_seconds
+    )
+    messages = resp.get('Messages', [])
+    for m in messages:
+        receipt = m['ReceiptHandle']
+        try:
+            body = json.loads(m['Body'])
+            process_sqs_message(body)
+            # delete after success
+            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt)
+        except Exception as ex:
+            print(f"[SQS] error processing: {ex}")
+
+def start_ingestor_loop():
+    if _INGESTOR_RUNNING["flag"]:
+        return
+    _INGESTOR_RUNNING["flag"] = True
+    # Use a NiceGUI timer as a cheap scheduler (every 3s)
+    def _tick():
+        try:
+            poll_sqs_once()
+        except Exception as e:
+            print(f"[SQS] poll error: {e}")
+    ui.timer(3.0, _tick)
+
 # =========================
 # Backend API
 # =========================
-@app.post('/api/upload/init')
+file_storage: Dict[str, Any] = {}
+
+@nice_app.post('/api/upload/init')
 async def api_upload_init(request: Request):
     try:
         data = await request.json()
@@ -107,13 +330,14 @@ async def api_upload_init(request: Request):
         )
 
         # Insert into documents table
-        doc_id = str(uuid4())
+        doc_id = str(uuid.uuid4())
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO documents (id, s3_key, title, mime_type)
+                INSERT INTO public.documents (id, s3_key, title, mime_type)
                 VALUES (%s, %s, %s, %s)
             """, (doc_id, key, title, mime_type))
 
+        # Send SQS message for ingestion
         try:
             payload = {
                 "document_id": doc_id,
@@ -141,10 +365,8 @@ async def api_upload_init(request: Request):
     except Exception as e:
         return {'error': f'Server error: {e}'}, 500
 
-
-@app.get('/api/search')
+@nice_app.get('/api/search')
 async def api_search(request: Request):
-    """Server-side list with optional substring filter on filename."""
     try:
         q = (request.query_params.get('q') or '').lower().strip()
         max_keys = int(request.query_params.get('limit', 200))
@@ -174,7 +396,7 @@ async def api_search(request: Request):
     except Exception as e:
         return {'error': f'Server error: {e}'}, 500
 
-@app.delete('/api/file')
+@nice_app.delete('/api/file')
 async def api_delete(request: Request):
     try:
         data = await request.json()
@@ -187,20 +409,9 @@ async def api_delete(request: Request):
         return {'error': f'S3 error: {e}'}, 500
     except Exception as e:
         return {'error': f'Server error: {e}'}, 500
-    
-@app.get('/api/search/db')
+
+@nice_app.get('/api/search/db')
 async def api_search_db(request: Request):
-    """
-    Lightweight search over the documents table.
-    Filters:
-      q            -> substring / fuzzy over title and s3_key (case-insensitive)
-      date_from    -> ISO 'YYYY-MM-DD' (uploaded_at >=)
-      date_to      -> ISO 'YYYY-MM-DD' (uploaded_at < next day)
-      mime         -> exact mime_type match (optional)
-      dept         -> department equals (optional)
-      max_sens     -> sensitivity <= value (default 2)
-      limit, offset
-    """
     q = (request.query_params.get('q') or '').strip()
     date_from = request.query_params.get('date_from')
     date_to = request.query_params.get('date_to')
@@ -219,7 +430,6 @@ async def api_search_db(request: Request):
     where = ["sensitivity <= %s"]
     args: List[object] = [max_sens]
 
-    # fuzzy / partial match on title or s3_key
     if q:
         where.append("(title ILIKE %s OR s3_key ILIKE %s)")
         like = f"%{q}%"
@@ -238,13 +448,12 @@ async def api_search_db(request: Request):
         args.append(date_from)
 
     if date_to:
-        # make it exclusive end (date boundary)
         where.append("uploaded_at < (%s::date + INTERVAL '1 day')")
         args.append(date_to)
 
     sql = f"""
     SELECT id, s3_key, title, mime_type, uploaded_at, owner_email, department, sensitivity, tags
-    FROM documents
+    FROM public.documents
     WHERE {" AND ".join(where)}
     ORDER BY uploaded_at DESC
     LIMIT %s OFFSET %s
@@ -254,9 +463,7 @@ async def api_search_db(request: Request):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, args)
         rows = cur.fetchall()
-
-        # total count for pagination
-        cur.execute(f"SELECT COUNT(*) FROM documents WHERE {' AND '.join(where)}", args[:-2])
+        cur.execute(f"SELECT COUNT(*) FROM public.documents WHERE {' AND '.join(where)}", args[:-2])
         total = cur.fetchone()[0]
 
     items = []
@@ -275,7 +482,7 @@ async def api_search_db(request: Request):
 
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
-@app.get('/api/presign_get')
+@nice_app.get('/api/presign_get')
 async def api_presign_get(request: Request):
     try:
         key = request.query_params.get('key')
@@ -283,24 +490,24 @@ async def api_presign_get(request: Request):
         if not key:
             return {'error': 'Missing key'}, 400
 
-        # Look up a nice filename + mime from DB
+        # Look up nice filename + mime from DB
         filename = os.path.basename(key)
         mime = None
         try:
             with get_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT title, mime_type FROM documents WHERE s3_key = %s LIMIT 1", (key,))
+                cur.execute("SELECT title, mime_type FROM public.documents WHERE s3_key = %s LIMIT 1", (key,))
                 row = cur.fetchone()
                 if row:
                     title, mime = row
-                    if title: 
+                    if title:
                         filename = title
         except Exception:
-            pass  # fallback to basename if DB lookup fails
+            pass
 
-        # Build safe Content-Disposition (RFC 5987 for UTF-8)
+        # Content-Disposition
         disp_type = "inline" if mode == "open" else "attachment"
-        filename_ascii = filename.replace('"', '')  # basic sanitize
-        filename_utf8 = quote(filename)             # e.g. Screenshot%202023-09-27%20131147.png
+        filename_ascii = filename.replace('"', '')
+        filename_utf8 = quote(filename)
         content_disp = f'{disp_type}; filename="{filename_ascii}"; filename*=UTF-8\'\'{filename_utf8}'
 
         params = {
@@ -309,7 +516,7 @@ async def api_presign_get(request: Request):
             'ResponseContentDisposition': content_disp,
         }
         if mime:
-            params['ResponseContentType'] = mime  # helps browsers render inline
+            params['ResponseContentType'] = mime
 
         url = s3.generate_presigned_url('get_object', Params=params, ExpiresIn=3600)
         return {'url': url}
@@ -319,12 +526,96 @@ async def api_presign_get(request: Request):
         return {'error': f'Server error: {e}'}, 500
 
 # =========================
-# Frontend
+# CHAT API (sessions, messages, RAG with Nova Pro)
+# =========================
+@nice_app.post('/api/chat/start')
+async def api_chat_start(payload: dict = Body(...)):
+    user_email = (payload.get("user_email") or "anonymous@local").strip()
+    sid = str(uuid.uuid4())
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO public.chat_sessions (id, user_email) VALUES (%s,%s)",
+            (sid, user_email)
+        )
+        cur.execute("SELECT started_at, title FROM public.chat_sessions WHERE id=%s", (sid,))
+        row = cur.fetchone()
+    return {"session_id": sid, "started_at": row[0].isoformat(), "title": row[1]}
+
+@nice_app.post('/api/chat/{session_id}/send')
+async def api_chat_send(session_id: str, request: Request):
+    body = await request.json()
+    print("DEBUG body:", body)
+
+    # Try all common keys, fallback to first string
+    question = (
+        body.get("message")
+        or body.get("content")
+        or body.get("text")
+        or next((v for v in body.values() if isinstance(v, str)), None)
+    )
+
+    if not question:
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {body}")
+
+    # 1. Always run semantic search
+    search_rows = semantic_search(question, top_k=3)
+    context_text = "\n\n".join([r["content"] for r in search_rows]) or "No relevant context found."
+
+    # 2. Build messages for Nova
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"text": "You are a helpful assistant. Use the provided context to answer user queries about files. "
+                        "If context is irrelevant, say you cannot find relevant info."}
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {"text": f"User query: {question}"}
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {"text": f"Database search results:\n{context_text}"}
+            ]
+        }
+    ]
+
+    # 3. Call Nova Pro
+    resp = bedrock_rt.invoke_model(
+        modelId="amazon.nova-pro-v1:0",
+        body=json.dumps({
+            "messages": messages,
+            "inferenceConfig": {"maxTokens": 300}
+        })
+    )
+
+    answer = json.loads(resp["body"].read())
+
+    # 4. Store chat message in DB
+    run_query(
+        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (gen_random_uuid(), %s, %s, %s)",
+        (session_id, "user", question)
+    )
+    run_query(
+        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (gen_random_uuid(), %s, %s, %s)",
+        (session_id, "assistant", answer["output"]["message"]["content"][0]["text"])
+    )
+
+    return {"answer": answer["output"]["message"]["content"][0]["text"]}
+
+# =========================
+# Frontend (NiceGUI)
 # =========================
 @ui.page('/')
 def main():
+    ui.label('Doc Uploader + RAG Chat (Nova Pro)').classes('text-h4 text-center mb-4')
 
-    ui.label('Doc Uploader').classes('text-h4 text-center mb-4')
+    # Start local SQS ingestor loop (simulate Lambda)
+    start_ingestor_loop()
 
     with ui.column().classes('w-full max-w-3xl mx-auto gap-6'):
 
@@ -337,13 +628,10 @@ def main():
             btn_upload.disable()
 
             def on_file_selected(event):
-                print(f"DEBUG: File selected: {event.name}")
-                
                 if not event or not event.content:
                     status.text = 'No file selected'
                     btn_upload.disable()
                     return
-                
                 try:
                     file_content = event.content.read()
                     file_storage['selected_file'] = file_content
@@ -362,55 +650,30 @@ def main():
             ).classes('w-full')
 
             async def do_upload(_=None):
-                print("DEBUG: do_upload function called")
-                
-                print(f"DEBUG: Checking file_storage keys: {list(file_storage.keys())}")
-                
                 if 'selected_file' not in file_storage:
-                    print("DEBUG: No selected_file found!")
                     ui.notify('No file selected', type='warning')
                     btn_upload.disable()
                     return
-                
-                print("DEBUG: File found in storage, proceeding...")
-                
                 try:
-                    print("DEBUG: Entered try block")
                     btn_upload.disable()
-                    
                     file_name = file_storage['file_name']
                     file_content = file_storage['selected_file']
-                    print(f"DEBUG: Got file - name: {file_name}, size: {len(file_content)}")
-
                     mime, _ = mimetypes.guess_type(file_name)
                     if not mime:
                         mime = 'application/octet-stream'
-                    print(f'DEBUG: Uploading {file_name} as {mime}')
 
-                    print("DEBUG: About to create httpx client")
                     async with httpx.AsyncClient() as client:
-                        print("DEBUG: httpx client created, making POST request")
-                        
-                        r = await client.post(f'{get_base_url()}/api/upload/init', json={'file_name': file_name})
-                        print(f"DEBUG: POST response status: {r.status_code}")
-                        print(f"DEBUG: POST response text: {r.text}")
-                        
+                        r = await client.post(f'{get_base_url()}/api/upload/init', json={'file_name': file_name, 'mime_type': mime, 'title': file_name})
                         r.raise_for_status()
                         data = r.json()
-                        
-                        print(f"DEBUG: Init response: {data}")
+
                         upload_url = data.get('upload_url')
-                        print(f"DEBUG: Upload URL: {upload_url}")
-                        
                         if not upload_url:
                             raise Exception("No upload_url in response")
 
-                        print("DEBUG: About to PUT file to S3")
                         put_resp = await client.put(upload_url, content=file_content)
-                        print(f"DEBUG: PUT response status: {put_resp.status_code}")
                         put_resp.raise_for_status()
 
-                    print("DEBUG: Upload successful!")
                     status.text = f'✅ Uploaded to s3://{S3_BUCKET}/{data["key"]}'
                     status.classes('text-green-600')
 
@@ -418,44 +681,29 @@ def main():
                     file_storage.pop('file_name', None)
 
                     await run_db_search()
-
                 except Exception as e:
-                    print(f"DEBUG: Exception caught: {e}")
-                    print(f"DEBUG: Exception type: {type(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    
                     status.text = f'❌ Upload failed: {e}'
                     status.classes('text-red-600')
                 finally:
-                    print("DEBUG: Finally block - re-enabling button")
-                    btn_upload.disable()  # Note: you probably want enable() here if upload fails
+                    btn_upload.enable()
 
-            btn_upload.on('click', do_upload)  # async handler is supported
+            btn_upload.on('click', do_upload)
 
-        # ---------- DB Search (by filename/title) ----------
+        # ---------- DB Search ----------
         with ui.card().classes('w-full'):
             ui.label('DB Search (title / key)').classes('text-h6')
 
             with ui.row().classes('items-center gap-3'):
-                q_input = ui.input(placeholder='e.g. "screenshot" or ".pdf"').classes('w-64')
+                q_input = ui.input(placeholder='e.g. "manual" or ".pdf"').classes('w-64')
                 date_from_in = ui.input(label='From (YYYY-MM-DD)').classes('w-40')
                 date_to_in   = ui.input(label='To (YYYY-MM-DD)').classes('w-40')
                 btn_db_search = ui.button('Search')
 
             db_table = ui.column().classes('w-full')
 
-            # ---- local helpers so we don't rely on outer scope ----
             async def presign_and_open(key: str):
                 async with httpx.AsyncClient() as client:
                     r = await client.get(f'{get_base_url()}/api/presign_get', params={'key': key, 'mode': 'open'})
-                    r.raise_for_status()
-                    url = r.json()['url']
-                ui.run_javascript(f'window.open("{url}", "_blank");')
-
-            async def presign_and_download(key: str):
-                async with httpx.AsyncClient() as client:
-                    r = await client.get(f'{get_base_url()}/api/presign_get', params={'key': key, 'mode': 'download'})
                     r.raise_for_status()
                     url = r.json()['url']
                 ui.run_javascript(f'window.open("{url}", "_blank");')
@@ -464,7 +712,6 @@ def main():
                 async def _h(_=None):
                     await handler(key)
                 return _h
-            # -------------------------------------------------------
 
             async def run_db_search(_=None):
                 try:
@@ -503,7 +750,6 @@ def main():
                                 ui.label(it['uploaded_at'].replace('T', ' ').split('.')[0]).classes('w-1/5')
                                 with ui.row().classes('w-1/5 gap-2'):
                                     ui.button('Open', on_click=make_async(presign_and_open, it['s3_key']))
-                                    ui.button('Download', on_click=make_async(presign_and_download, it['s3_key']))
 
                 except Exception as e:
                     db_table.clear()
@@ -512,126 +758,74 @@ def main():
 
             btn_db_search.on('click', run_db_search)
 
+        # ---------- Chatbot Card ----------
+        with ui.card().classes('w-full'):
+            ui.label('Ask your internal documents (Nova Pro, us-east-1)').classes('text-h6')
+            ta = ui.textarea(placeholder='Type a question…').props('rows=3').classes('w-full')
+            btn_start = ui.button('Start Chat')
+            btn_send = ui.button('Send').classes('ml-2')
+            btn_send.disable()
+            out = ui.column().classes('w-full mt-2')
+            state = {"session_id": None}
 
-        # # ---------- Browser / Search Card ----------
-        # with ui.card().classes('w-full'):
-        #     ui.label('Files').classes('text-h6')
+            async def start_chat(_=None):
+                try:
+                    async with httpx.AsyncClient() as client:
+                        r = await client.post(f'{get_base_url()}/api/chat/start', json={"user_email": "tech@factory.local"})
+                        r.raise_for_status()
+                        payload = r.json()
+                        state["session_id"] = payload["session_id"]
+                    out.clear()
+                    with out: ui.label(f'✅ Session started: {state["session_id"]}').classes('text-green-600')
+                    btn_send.enable()
+                except Exception as e:
+                    out.clear()
+                    with out: ui.label(f'❌ Start error: {e}').classes('text-red-600')
 
-        #     with ui.row().classes('items-center gap-3'):
-        #         prefix_input = ui.input(label='Prefix', value='uploads/').classes('w-64')
-        #         search_input = ui.input(placeholder='Search filename... (filters current page)')
-        #         btn_refresh = ui.button('Refresh')
+            async def send_msg(_=None):
+                try:
+                    q = (ta.value or "").strip()
+                    if not q:
+                        ui.notify('Question is empty', type='warning'); return
+                    if not state["session_id"]:
+                        ui.notify('Start a chat first', type='warning'); return
 
-        #     table_container = ui.column().classes('w-full')
-        #     state = {'next_token': None, 'rows': []}
+                    with out:
+                        ui.label(f'You: {q}').classes('font-medium')
+                    ta.value = ""
 
-        #     async def load_page(reset: bool = True):
-        #         try:
-        #             params = {'prefix': prefix_input.value or 'uploads/', 'limit': 200}
-        #             if not reset and state['next_token']:
-        #                 params['token'] = state['next_token']
+                    async with httpx.AsyncClient() as client:
+                        r = await client.post(
+                            f'{get_base_url()}/api/chat/{state["session_id"]}/send',
+                            json={"q": q, "k": 6}
+                        )
+                        r.raise_for_status()
+                        payload = r.json()
 
-        #             async with httpx.AsyncClient() as client:
-        #                 r = await client.get('/api/search', params=params)
-        #                 r.raise_for_status()
-        #                 payload = r.json()
+                    with out:
+                        ui.markdown(payload["answer"])
+                        if payload.get("sources"):
+                            ui.label('Sources:').classes('mt-1 text-gray-600')
+                            for s in payload["sources"]:
+                                row = ui.row().classes('items-center gap-2')
+                                ui.label(f"• {s['title']}  (rel ~ {s['score']:.3f})")
+                                async def _open(key=s["s3_key"]):
+                                    async with httpx.AsyncClient() as client:
+                                        rr = await client.get(f'{get_base_url()}/api/presign_get', params={'key': key, 'mode': 'open'})
+                                        rr.raise_for_status()
+                                        url = rr.json()['url']
+                                    ui.run_javascript(f'window.open("{url}", "_blank");')
+                                ui.button('Open', on_click=_open).props('flat size=sm')
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()     # prints full stack in your console
+                    return {"error": f"{type(e).__name__}: {e}"}, 500
 
-        #             state['rows'] = payload.get('items', []) if reset else state['rows'] + payload.get('items', [])
-        #             state['next_token'] = payload.get('next_token')
-        #             draw_table()
+            btn_start.on('click', start_chat)
+            btn_send.on('click', send_msg)
 
-        #         except Exception as e:
-        #             table_container.clear()
-        #             with table_container:
-        #                 ui.label(f'❌ List error: {e}').classes('text-red-600')
-
-        #     def draw_table():
-        #         table_container.clear()
-        #         needle = (search_input.value or '').lower().strip()
-        #         rows = state['rows']
-        #         if needle:
-        #             rows = [r for r in rows if needle in r['filename'].lower()]
-
-        #         if not rows:
-        #             with table_container:
-        #                 ui.label('No files found for the current page.').classes('text-gray-600')
-        #             return
-
-        #         with table_container:
-        #             with ui.row().classes('font-medium text-gray-700'):
-        #                 ui.label('File').classes('w-2/5')
-        #                 ui.label('Size').classes('w-1/5')
-        #                 ui.label('Last Modified').classes('w-1/5')
-        #                 ui.label('Actions').classes('w-1/5')
-
-        #             # helper to build async click handlers with captured key
-        #             def make_async(handler, key):
-        #                 async def _h(_=None):
-        #                     await handler(key)
-        #                 return _h
-
-        #             for r in rows:
-        #                 with ui.row().classes('items-center py-1 border-b border-gray-100'):
-        #                     ui.label(r['filename']).classes('w-2/5 truncate')
-        #                     ui.label(human_size(r['size'])).classes('w-1/5')
-        #                     lm = r['last_modified'].replace('T', ' ').split('.')[0]
-        #                     ui.label(lm).classes('w-1/5')
-
-        #                     with ui.row().classes('w-1/5 gap-2'):
-        #                         ui.button('Link', on_click=make_async(copy_link, r['key']))
-        #                         ui.button('Download', on_click=make_async(open_link, r['key']))
-        #                         ui.button('Delete', on_click=make_async(delete_key, r['key'])).props('color=negative flat')
-
-        #         with table_container:
-        #             with ui.row().classes('justify-between items-center mt-2'):
-        #                 ui.label('Page size: 200').classes('text-gray-500')
-        #                 if state['next_token']:
-        #                     async def load_more(_=None):
-        #                         await load_page(reset=False)
-        #                     ui.button('Load more', on_click=load_more)
-
-        #     async def refresh_list(_=None):
-        #         await load_page(reset=True)
-
-        #     async def copy_link(key: str):
-        #         try:
-        #             async with httpx.AsyncClient() as client:
-        #                 r = await client.get('/api/presign_get', params={'key': key})
-        #                 r.raise_for_status()
-        #                 url = r.json()['url']
-        #             ui.run_javascript(f'navigator.clipboard.writeText("{url}")')
-        #             ui.notify('Presigned URL copied', type='positive')
-        #         except Exception as e:
-        #             ui.notify(f'Failed to copy link: {e}', type='negative')
-
-        #     async def open_link(key: str):
-        #         try:
-        #             async with httpx.AsyncClient() as client:
-        #                 r = await client.get('/api/presign_get', params={'key': key})
-        #                 r.raise_for_status()
-        #                 url = r.json()['url']
-        #             ui.open(url)
-        #         except Exception as e:
-        #             ui.notify(f'Download failed: {e}', type='negative')
-
-        #     async def delete_key(key: str):
-        #         try:
-        #             async with httpx.AsyncClient() as client:
-        #                 r = await client.delete('/api/file', json={'key': key})
-        #                 r.raise_for_status()
-        #             ui.notify('Deleted', type='positive')
-        #             await refresh_list()
-        #         except Exception as e:
-        #             ui.notify(f'Delete failed: {e}', type='negative')
-
-        #     # wire up events (async handlers supported)
-        #     btn_refresh.on('click', refresh_list)
-        #     search_input.on('input', draw_table)
-        #     prefix_input.on('change', refresh_list)
-
-        #     # auto-load on page ready (one-shot)
-        #     ui.timer(0.01, refresh_list, once=True)  # run once after render
-
-if __name__ == "__main__":
-    # local dev only
-    ui.run(host="0.0.0.0", port=8080, storage_secret="super-secret-key")
+# =========================
+# Run
+# =========================
+if __name__ in {'__main__', '__mp_main__'}:
+    ui.run(host='0.0.0.0', port=8080, storage_secret='super-secret-key')
