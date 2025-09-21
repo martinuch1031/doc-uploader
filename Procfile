@@ -1,1 +1,1 @@
-web: gunicorn -b :8000 application:application
+web: gunicorn -k uvicorn.workers.UvicornWorker -b :8000 application:application
