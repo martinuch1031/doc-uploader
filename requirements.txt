@@ -1,0 +1,18 @@
+# Web framework
+nicegui
+fastapi
+uvicorn
+gunicorn
+
+# AWS SDK
+boto3
+botocore
+
+# Database
+psycopg[binary]
+
+# HTTP client
+httpx
+
+# Utils
+python-dotenv
