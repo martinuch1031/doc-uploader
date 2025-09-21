@@ -41,7 +41,8 @@ def get_conn():
     )
 
 # With this:
-session = boto3.Session(profile_name='martin')
+# session = boto3.Session(profile_name='martin')
+session = boto3.Session()
 
 def get_bucket_region(bucket: str) -> str:
     # S3 returns None for us-east-1
