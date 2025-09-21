@@ -631,5 +631,6 @@ def main():
         #     # auto-load on page ready (one-shot)
         #     ui.timer(0.01, refresh_list, once=True)  # run once after render
 
-if __name__ in {'__main__', '__mp_main__'}:
-    ui.run(host='0.0.0.0', port=8080, storage_secret='super-secret-key')
+if __name__ == "__main__":
+    # local dev only
+    ui.run(host="0.0.0.0", port=8080, storage_secret="super-secret-key")
